@@ -8,9 +8,9 @@ import os
 import uuid
 from PIL import Image
 from datetime import datetime
-from db.database_manager import *
-from processing.document_processor import *
-from engine.chatbot_engine import *
+from database_manager import *
+from document_processor import *
+from chatbot_engine import *
 
 # Page configuration
 st.set_page_config(

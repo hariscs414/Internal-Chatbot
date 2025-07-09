@@ -1,5 +1,5 @@
 import streamlit as st
-from ui.main_interface import *
+from main_interface import *
 def main():
     """Main application function with enhanced routing and session management"""
     

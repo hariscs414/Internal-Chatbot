@@ -1,4 +1,4 @@
-#document_processor.py
+# document_processor.py
 import re
 import pickle
 import os
@@ -13,6 +13,8 @@ import fitz
 import streamlit as st
 from typing import Dict, List, Optional
 from docx import Document
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 import json
 
 # Download required NLTK data
@@ -20,7 +22,6 @@ try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
-
 try:
     nltk.data.find('tokenizers/punkt_tab')
 except LookupError:
@@ -63,7 +64,7 @@ class DocumentProcessor:
             if os.path.isfile(file_path):
                 file_extension = filename.lower().split('.')[-1]
                 
-                if file_extension in ['pdf', 'docx']:
+                if file_extension in ['pdf', 'docx', 'pptx','ppt']:
                     try:
                         with open(file_path, 'rb') as file:
                             file_content = file.read()
@@ -99,7 +100,7 @@ class DocumentProcessor:
             return set()
     
     def process_pdf(self, file_content: bytes, filename: str) -> Dict:
-        """Extract text and images from PDF with proper base64 encoding"""
+        """Extract text and images from PDF with improved error code association"""
         text_content = ""
         images = []
         
@@ -111,7 +112,7 @@ class DocumentProcessor:
                 page_text = page.get_text()
                 text_content += page_text + "\n"
                 
-                # Extract images with proper encoding
+                # Extract images with better error code association
                 image_list = page.get_images()
                 for img_index, img in enumerate(image_list):
                     try:
@@ -119,14 +120,50 @@ class DocumentProcessor:
                         pix = fitz.Pixmap(pdf_doc, xref)
                         if pix.n < 5:  # GRAY or RGB
                             img_data = pix.tobytes("png")
-                            # Convert to base64 immediately
                             img_b64 = base64.b64encode(img_data).decode('utf-8')
                             
-                            # Try to associate with error codes found on this page
-                            associated_codes = self.find_error_codes_on_page(page_text)
+                            # Improved error code association
+                            # Look for error codes in a wider context around the image
+                            context_text = ""
+                            
+                            # Get text from current page
+                            current_page_text = page_text
+                            
+                            # Get text from previous page if available
+                            if page_num > 0:
+                                prev_page = pdf_doc.load_page(page_num - 1)
+                                prev_text = prev_page.get_text()
+                                context_text = prev_text[-500:] + " " + current_page_text  # Last 500 chars of previous page
+                            else:
+                                context_text = current_page_text
+                            
+                            # Get text from next page if available
+                            if page_num < len(pdf_doc) - 1:
+                                next_page = pdf_doc.load_page(page_num + 1)
+                                next_text = next_page.get_text()
+                                context_text += " " + next_text[:500]  # First 500 chars of next page
+                            
+                            # Find error codes in this extended context
+                            associated_codes = self.find_error_codes_on_page(context_text)
+                            
+                            # If no codes found in extended context, look for codes in image vicinity
+                            if not associated_codes:
+                                # Try to find error codes in the immediate text around the image position
+                                # This is a simplified approach - in a real implementation, 
+                                # you'd analyze the image position relative to text blocks
+                                text_blocks = page_text.split('\n')
+                                for block in text_blocks:
+                                    if len(block.strip()) > 10:  # Meaningful text block
+                                        block_codes = self.find_error_codes_on_page(block)
+                                        if block_codes:
+                                            associated_codes.extend(block_codes)
+                                            break
+                            
+                            # Remove duplicates and limit to most relevant codes
+                            associated_codes = list(set(associated_codes))[:3]
                             
                             images.append({
-                                "data": img_b64,  # Store as base64 string
+                                "data": img_b64,
                                 "page": page_num + 1,
                                 "index": img_index,
                                 "associated_codes": associated_codes,
@@ -144,11 +181,75 @@ class DocumentProcessor:
         
         return {"text": text_content, "images": images}
     
+    def process_pptx(self, file_content: bytes, filename: str) -> Dict:
+        """Extract text and images from PowerPoint presentation"""
+        text_content = ""
+        images = []
+        
+        try:
+            prs = Presentation(BytesIO(file_content))
+            
+            for slide_num, slide in enumerate(prs.slides):
+                slide_text = ""
+                
+                # Extract text from all shapes
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        slide_text += shape.text + "\n"
+                    
+                    # Extract images from shapes
+                    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                        try:
+                            image = shape.image
+                            img_data = image.blob
+                            img_b64 = base64.b64encode(img_data).decode('utf-8')
+                            
+                            # Try to associate with error codes found on this slide
+                            associated_codes = self.find_error_codes_on_page(slide_text)
+                            
+                            images.append({
+                                "data": img_b64,
+                                "page": slide_num + 1,  # Use slide number as page
+                                "index": len(images),
+                                "associated_codes": associated_codes,
+                                "page_text": slide_text[:500]
+                            })
+                        except Exception as e:
+                            print(f"Error processing image on slide {slide_num}: {e}")
+                            continue
+                
+                # Add slide header
+                text_content += f"=== Slide {slide_num + 1} ===\n"
+                text_content += slide_text + "\n\n"
+                
+                # Extract text from notes
+                if slide.notes_slide and slide.notes_slide.notes_text_frame:
+                    notes_text = slide.notes_slide.notes_text_frame.text
+                    if notes_text.strip():
+                        text_content += f"Notes: {notes_text}\n\n"
+        
+        except Exception as e:
+            st.error(f"Error processing PowerPoint {filename}: {str(e)}")
+            return {"text": "", "images": [], "error": str(e)}
+        
+        return {"text": text_content, "images": images}
+    
     def find_error_codes_on_page(self, text: str) -> List[str]:
-        """Find error codes mentioned on a specific page"""
-        hex_pattern = r'\b([A-Fa-f0-9]{4})\b'
-        codes = re.findall(hex_pattern, text.upper())
-        return list(set(codes))  # Remove duplicates
+        """Find error codes mentioned on a specific page with improved detection"""
+        # Multiple patterns for better error code detection
+        patterns = [
+            r'\b([A-Fa-f0-9]{4})\b',  # Basic hex pattern
+            r'Code\s+([A-Fa-f0-9]{4})',  # Code XXXX
+            r'Error\s+([A-Fa-f0-9]{4})',  # Error XXXX
+            r'([A-Fa-f0-9]{4})\s*[-:]\s*',  # XXXX: or XXXX-
+        ]
+        
+        codes = set()
+        for pattern in patterns:
+            matches = re.findall(pattern, text.upper())
+            codes.update(matches)
+        
+        return list(codes)
     
     def process_docx(self, file_content: bytes, filename: str) -> Dict:
         """Extract text from Word document"""
@@ -221,7 +322,7 @@ class DocumentProcessor:
         return self.model.encode(texts)
     
     def ingest_document(self, file_content: bytes, filename: str, file_type: str) -> bool:
-        """Process and store document in database with proper image handling"""
+        """Process and store document with improved image-error code association"""
         conn = None
         try:
             # Process document based on type
@@ -229,6 +330,8 @@ class DocumentProcessor:
                 result = self.process_pdf(file_content, filename)
             elif file_type == "docx":
                 result = self.process_docx(file_content, filename)
+            elif file_type == "pptx":
+                result = self.process_pptx(file_content, filename)
             else:
                 st.error(f"Unsupported file type: {file_type}")
                 return False
@@ -245,17 +348,24 @@ class DocumentProcessor:
             
             conn.execute("BEGIN IMMEDIATE")
             
+            # Add metadata
+            metadata = {"image_count": len(images)}
+            if file_type == "pptx":
+                slide_count = text_content.count("=== Slide")
+                metadata["slide_count"] = slide_count
+            
             cursor.execute("""
                 INSERT INTO documents (filename, content, doc_type, metadata) 
                 VALUES (?, ?, ?, ?)
-            """, (filename, text_content, file_type, json.dumps({"image_count": len(images)})))
+            """, (filename, text_content, file_type, json.dumps(metadata)))
             
             doc_id = cursor.lastrowid
             
-            # Extract and store error codes with enhanced context
+            # Extract and store error codes
             error_codes = self.extract_error_codes_with_context(text_content)
+            stored_error_codes = {}  # Track stored error codes for better image association
+            
             for error_code in error_codes:
-                # Store main error code entry
                 cursor.execute("""
                     INSERT OR REPLACE INTO error_codes (code, description, source_doc, procedure_steps, category) 
                     VALUES (?, ?, ?, ?, ?)
@@ -263,47 +373,57 @@ class DocumentProcessor:
                     error_code["code"], 
                     error_code["description"], 
                     filename,
-                    error_code["context"],  # Store context as procedure steps
-                    "extracted"  # Mark as extracted from document
+                    error_code["context"],
+                    "extracted"
                 ))
+                stored_error_codes[error_code["code"]] = error_code
             
-            # Store images with proper error code associations
+            # Store images with improved error code association
             for i, img in enumerate(images):
-                img_filename = f"{filename}_page_{img['page']}_img_{i}"
+                if file_type == "pptx":
+                    img_filename = f"{filename}_slide_{img['page']}_img_{i}"
+                else:
+                    img_filename = f"{filename}_page_{img['page']}_img_{i}"
                 
-                # Store image with base64 data (already encoded)
+                # Determine the best error code association
+                best_associated_code = None
+                if img.get("associated_codes"):
+                    # Use the first associated code if it exists in our stored codes
+                    for code in img["associated_codes"]:
+                        if code in stored_error_codes:
+                            best_associated_code = code
+                            break
+                    
+                    # If no match in stored codes, use the first found code
+                    if not best_associated_code:
+                        best_associated_code = img["associated_codes"][0]
+                
+                # Enhanced description with context
+                enhanced_description = f"Image from {filename} {'slide' if file_type == 'pptx' else 'page'} {img['page']}"
+                
+                # Add page text context to description for better search
+                if img.get('page_text'):
+                    page_text_clean = re.sub(r'\s+', ' ', img['page_text'][:200])  # Clean and truncate
+                    enhanced_description += f" - Context: {page_text_clean}"
+                
+                # Add error code context if available
+                if best_associated_code and best_associated_code in stored_error_codes:
+                    error_context = stored_error_codes[best_associated_code]['description'][:100]
+                    enhanced_description += f" - Related to: {error_context}"
+                
+                # Store image in database
                 cursor.execute("""
-                    INSERT INTO images (filename, image_data, description, step_number) 
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO images (filename, image_data, description, step_number, associated_code) 
+                    VALUES (?, ?, ?, ?, ?)
                 """, (
                     img_filename, 
-                    img["data"],  # Already base64 encoded
-                    f"Image from {filename} page {img['page']}", 
-                    img['page']
+                    img["data"],
+                    enhanced_description,
+                    img['page'],
+                    best_associated_code
                 ))
-                
-                image_id = cursor.lastrowid
-                
-                # Associate image with error codes found on the same page
-                for code in img.get("associated_codes", []):
-                    cursor.execute("""
-                        UPDATE images 
-                        SET associated_code = ? 
-                        WHERE id = ?
-                    """, (code, image_id))
-                    
-                    # If no specific association, also try to link by proximity
-                    if not img.get("associated_codes"):
-                        # Find the most recent error code in the document
-                        recent_codes = [ec["code"] for ec in error_codes[-3:]]  # Last 3 codes
-                        if recent_codes:
-                            cursor.execute("""
-                                UPDATE images 
-                                SET associated_code = ? 
-                                WHERE id = ?
-                            """, (recent_codes[0], image_id))
             
-            # Create embeddings for text chunks
+            # Create embeddings for meaningful sentences only
             try:
                 sentences = sent_tokenize(text_content)
             except LookupError:
@@ -311,26 +431,41 @@ class DocumentProcessor:
                 sentences = [s.strip() + '.' for s in sentences if s.strip()]
             
             if sentences:
-                # Filter out very short sentences
-                meaningful_sentences = [s for s in sentences if len(s.strip()) > 20]
+                # Filter for meaningful sentences
+                meaningful_sentences = [
+                    s for s in sentences 
+                    if len(s.strip()) > 30 and  # Longer threshold
+                    not s.strip().startswith("=== Slide") and
+                    not s.strip().startswith("Page") and
+                    len(s.split()) > 5  # At least 5 words
+                ]
                 
                 if meaningful_sentences:
-                    embeddings = self.create_embeddings(meaningful_sentences)
-                    
-                    for sentence, embedding in zip(meaningful_sentences, embeddings):
-                        cursor.execute("""
-                            INSERT INTO embeddings (content_id, content_type, embedding, text_content) 
-                            VALUES (?, ?, ?, ?)
-                        """, (str(doc_id), "document", pickle.dumps(embedding), sentence))
+                    # Create embeddings in batches for better performance
+                    batch_size = 50
+                    for i in range(0, len(meaningful_sentences), batch_size):
+                        batch = meaningful_sentences[i:i+batch_size]
+                        embeddings = self.create_embeddings(batch)
+                        
+                        for sentence, embedding in zip(batch, embeddings):
+                            cursor.execute("""
+                                INSERT INTO embeddings (content_id, content_type, embedding, text_content) 
+                                VALUES (?, ?, ?, ?)
+                            """, (str(doc_id), "document", pickle.dumps(embedding), sentence))
             
             conn.commit()
+            
+            # Print summary of extracted images
+            if images:
+                st.success(f"Extracted {len(images)} images from {filename}")
+            
             return True
             
         except Exception as e:
             if conn:
                 conn.rollback()
             st.error(f"Error ingesting document {filename}: {str(e)}")
-            print(f"Detailed error: {e}")  # For debugging
+            print(f"Detailed error: {e}")
             return False
         finally:
             if conn:
@@ -354,13 +489,24 @@ class DocumentProcessor:
             cursor.execute("SELECT COUNT(*) FROM embeddings")
             embedding_count = cursor.fetchone()[0]
             
+            # Get document type breakdown
+            cursor.execute("SELECT doc_type, COUNT(*) FROM documents GROUP BY doc_type")
+            doc_types = dict(cursor.fetchall())
+            
             conn.close()
             
             return {
                 "documents": doc_count,
                 "error_codes": error_code_count,
                 "images": image_count,
-                "embeddings": embedding_count
+                "embeddings": embedding_count,
+                "document_types": doc_types
             }
         except Exception:
-            return {"documents": 0, "error_codes": 0, "images": 0, "embeddings": 0}
+            return {
+                "documents": 0, 
+                "error_codes": 0, 
+                "images": 0, 
+                "embeddings": 0,
+                "document_types": {}
+            }

@@ -11,7 +11,7 @@ class DatabaseManager:
     def __init__(self, db_path: str = "chatbot_data.db"):
         self.db_path = db_path
         self.init_database()
-    
+        
     def init_database(self):
         """Initialize SQLite database with required tables"""
         conn = sqlite3.connect(self.db_path)
@@ -56,11 +56,13 @@ class DatabaseManager:
                 procedure_steps TEXT,
                 source_doc TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                source_type TEXT,   -- NEW COLUMN
+                metadata TEXT       -- NEW COLUMN
             )
         ''')
         
-        # Images table
+        # Images table (add metadata column)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS images (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,10 +71,24 @@ class DatabaseManager:
                 associated_code TEXT,
                 step_number INTEGER,
                 description TEXT,
+                metadata TEXT,  -- NEW COLUMN
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+        # NEW: Tables table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id INTEGER NOT NULL,
+                table_id TEXT NOT NULL,
+                page_number INTEGER NOT NULL,
+                raw_content TEXT,
+                formatted_content TEXT,
+                bbox TEXT,  -- JSON string of bounding box
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (doc_id) REFERENCES documents(id)
+            )
+        ''')
         # Chat history table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_history (
@@ -104,7 +120,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_username ON chat_history(username)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_embeddings_content ON embeddings(content_id, content_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_documents_filename ON documents(filename)")
-        
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_tables_doc_id ON tables(doc_id)")
         # Create default admin user if not exists
         cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
         if cursor.fetchone()[0] == 0:

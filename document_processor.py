@@ -64,7 +64,7 @@ class DocumentProcessor:
             if os.path.isfile(file_path):
                 file_extension = filename.lower().split('.')[-1]
                 
-                if file_extension in ['pdf', 'docx', 'pptx','ppt']:
+                if file_extension in ['pdf', 'docx', 'pptx', 'ppt']:
                     try:
                         with open(file_path, 'rb') as file:
                             file_content = file.read()
@@ -100,19 +100,43 @@ class DocumentProcessor:
             return set()
     
     def process_pdf(self, file_content: bytes, filename: str) -> Dict:
-        """Extract text and images from PDF with improved error code association"""
+        """Extract text, tables, images, and structured content from PDF with improved parsing"""
         text_content = ""
         images = []
+        tables = []
+        structured_content = []
         
         try:
             pdf_doc = fitz.open(stream=file_content, filetype="pdf")
             
             for page_num in range(len(pdf_doc)):
                 page = pdf_doc.load_page(page_num)
-                page_text = page.get_text()
-                text_content += page_text + "\n"
                 
-                # Extract images with better error code association
+                # Extract raw text
+                page_text = page.get_text()
+                
+                # Extract structured text with formatting
+                text_dict = page.get_text("dict")
+                structured_page_content = self._extract_structured_content_from_page(text_dict, page_num + 1)
+                structured_content.extend(structured_page_content)
+                
+                # Extract tables using text blocks analysis
+                page_tables = self._extract_tables_from_page(page, page_num + 1)
+                tables.extend(page_tables)
+                
+                # Build comprehensive text content
+                page_content = f"\n=== PAGE {page_num + 1} ===\n"
+                page_content += page_text
+                
+                # Add structured table content
+                if page_tables:
+                    page_content += "\n--- TABLES ---\n"
+                    for table in page_tables:
+                        page_content += table['formatted_text'] + "\n"
+                
+                text_content += page_content + "\n"
+                
+                # Extract images with enhanced context association
                 image_list = page.get_images()
                 for img_index, img in enumerate(image_list):
                     try:
@@ -122,52 +146,21 @@ class DocumentProcessor:
                             img_data = pix.tobytes("png")
                             img_b64 = base64.b64encode(img_data).decode('utf-8')
                             
-                            # Improved error code association
-                            # Look for error codes in a wider context around the image
-                            context_text = ""
-                            
-                            # Get text from current page
-                            current_page_text = page_text
-                            
-                            # Get text from previous page if available
-                            if page_num > 0:
-                                prev_page = pdf_doc.load_page(page_num - 1)
-                                prev_text = prev_page.get_text()
-                                context_text = prev_text[-500:] + " " + current_page_text  # Last 500 chars of previous page
-                            else:
-                                context_text = current_page_text
-                            
-                            # Get text from next page if available
-                            if page_num < len(pdf_doc) - 1:
-                                next_page = pdf_doc.load_page(page_num + 1)
-                                next_text = next_page.get_text()
-                                context_text += " " + next_text[:500]  # First 500 chars of next page
-                            
-                            # Find error codes in this extended context
+                            # Enhanced context analysis for error codes and table associations
+                            context_text = self._get_enhanced_image_context(pdf_doc, page_num, page_text, page_tables)
                             associated_codes = self.find_error_codes_on_page(context_text)
                             
-                            # If no codes found in extended context, look for codes in image vicinity
-                            if not associated_codes:
-                                # Try to find error codes in the immediate text around the image position
-                                # This is a simplified approach - in a real implementation, 
-                                # you'd analyze the image position relative to text blocks
-                                text_blocks = page_text.split('\n')
-                                for block in text_blocks:
-                                    if len(block.strip()) > 10:  # Meaningful text block
-                                        block_codes = self.find_error_codes_on_page(block)
-                                        if block_codes:
-                                            associated_codes.extend(block_codes)
-                                            break
-                            
-                            # Remove duplicates and limit to most relevant codes
-                            associated_codes = list(set(associated_codes))[:3]
+                            # Try to associate with nearby tables
+                            associated_tables = [t['id'] for t in page_tables]
                             
                             images.append({
                                 "data": img_b64,
                                 "page": page_num + 1,
                                 "index": img_index,
                                 "associated_codes": associated_codes,
-                                "page_text": page_text[:500]  # Store snippet for context
+                                "associated_tables": associated_tables,
+                                "page_text": page_text[:500],
+                                "context": context_text[:300]
                             })
                         pix = None
                     except Exception as e:
@@ -177,9 +170,180 @@ class DocumentProcessor:
             pdf_doc.close()
         except Exception as e:
             st.error(f"Error processing PDF {filename}: {str(e)}")
-            return {"text": "", "images": [], "error": str(e)}
+            return {"text": "", "images": [], "tables": [], "structured_content": [], "error": str(e)}
         
-        return {"text": text_content, "images": images}
+        return {
+            "text": text_content, 
+            "images": images, 
+            "tables": tables,
+            "structured_content": structured_content
+        }
+
+    def _extract_structured_content_from_page(self, text_dict: dict, page_num: int) -> List[Dict]:
+        """Extract structured content like headings, lists, and formatted sections"""
+        structured_items = []
+        
+        try:
+            for block in text_dict.get("blocks", []):
+                if "lines" in block:
+                    # Analyze text blocks for structure
+                    block_text = ""
+                    font_sizes = []
+                    is_bold = False
+                    
+                    for line in block["lines"]:
+                        for span in line.get("spans", []):
+                            span_text = span.get("text", "").strip()
+                            if span_text:
+                                block_text += span_text + " "
+                                font_sizes.append(span.get("size", 12))
+                                if span.get("flags", 0) & 2**4:  # Bold flag
+                                    is_bold = True
+                    
+                    block_text = block_text.strip()
+                    if not block_text:
+                        continue
+                    
+                    # Determine content type
+                    avg_font_size = sum(font_sizes) / len(font_sizes) if font_sizes else 12
+                    content_type = self._classify_content_type(block_text, avg_font_size, is_bold)
+                    
+                    if content_type != "regular_text":
+                        structured_items.append({
+                            "type": content_type,
+                            "text": block_text,
+                            "page": page_num,
+                            "font_size": avg_font_size,
+                            "is_bold": is_bold
+                        })
+        
+        except Exception as e:
+            print(f"Error extracting structured content from page {page_num}: {e}")
+        
+        return structured_items
+
+    def _classify_content_type(self, text: str, font_size: float, is_bold: bool) -> str:
+        """Classify text content type based on formatting and patterns"""
+        text_lower = text.lower().strip()
+        
+        # Headers/Titles (larger font, bold, or specific patterns)
+        if (font_size > 14 or is_bold) and len(text) < 100:
+            if any(keyword in text_lower for keyword in ['code', 'error', 'fault', 'diagnostic']):
+                return "section_header"
+            if text.isupper() or (is_bold and len(text.split()) <= 8):
+                return "title"
+        
+        # Lists (numbered or bulleted)
+        if re.match(r'^\d+\.?\s', text) or re.match(r'^[•\-\*]\s', text):
+            return "list_item"
+        
+        # Table headers or structured data
+        if '|' in text or '\t' in text or (len(text.split()) <= 10 and any(c.isdigit() for c in text)):
+            return "tabular_data"
+        
+        # Error codes or technical references
+        if re.search(r'\b[A-F0-9]{4}\b', text) or any(keyword in text_lower for keyword in ['msk', 'blt', 'code']):
+            return "error_reference"
+        
+        # Steps or procedures
+        if re.match(r'^\d+\.\s', text) and len(text) > 20:
+            return "procedure_step"
+        
+        return "regular_text"
+
+    def _extract_tables_from_page(self, page, page_num: int) -> List[Dict]:
+        """Extract and format tables from PDF page using text block analysis"""
+        tables = []
+        
+        try:
+            # Get text as dictionary with positioning info
+            text_dict = page.get_text("dict")
+            
+            # Try to find table-like structures
+            table_blocks = []
+            for block in text_dict.get("blocks", []):
+                if "lines" in block:
+                    block_text = ""
+                    for line in block["lines"]:
+                        line_text = ""
+                        for span in line.get("spans", []):
+                            line_text += span.get("text", "")
+                        block_text += line_text + "\n"
+                    
+                    # Check if block looks like a table
+                    if self._is_table_block(block_text):
+                        table_blocks.append({
+                            "text": block_text,
+                            "bbox": block.get("bbox", [0, 0, 0, 0])
+                        })
+            
+            # Process identified table blocks
+            for i, table_block in enumerate(table_blocks):
+                formatted_table = self._format_table_text(table_block["text"])
+                if formatted_table:
+                    tables.append({
+                        "id": f"page_{page_num}_table_{i}",
+                        "page": page_num,
+                        "raw_text": table_block["text"],
+                        "formatted_text": formatted_table,
+                        "bbox": table_block["bbox"]
+                    })
+        
+        except Exception as e:
+            print(f"Error extracting tables from page {page_num}: {e}")
+        
+        return tables
+
+    def _is_table_block(self, text: str) -> bool:
+        """Determine if a text block represents a table"""
+        lines = text.strip().split('\n')
+        if len(lines) < 2:
+            return False
+        
+        # Check for table indicators
+        table_indicators = 0
+        
+        # Look for consistent column separators
+        if any('|' in line for line in lines):
+            table_indicators += 2
+        
+        # Look for consistent spacing patterns
+        if len(set(len(line) for line in lines if line.strip())) <= 3:
+            table_indicators += 1
+        
+        # Look for headers with data rows
+        first_line = lines[0].strip()
+        if any(keyword in first_line.lower() for keyword in ['position', 'code', 'description', 'dérangements']):
+            table_indicators += 2
+        
+        # Look for structured data patterns (numbers, codes)
+        structured_lines = sum(1 for line in lines if re.search(r'\d+', line) or re.search(r'[XxOo-]{2,}', line))
+        if structured_lines > len(lines) * 0.5:
+            table_indicators += 1
+        
+        return table_indicators >= 2
+
+    def _format_table_text(self, raw_table_text: str) -> str:
+        """Format raw table text into a more structured format"""
+        lines = [line.strip() for line in raw_table_text.strip().split('\n') if line.strip()]
+        if not lines:
+            return ""
+        
+        formatted_lines = []
+        
+        # Try to identify header and data rows
+        for i, line in enumerate(lines):
+            # Clean up the line
+            clean_line = re.sub(r'\s+', ' ', line)
+            
+            # Add visual separation for what looks like headers
+            if i == 0 or any(keyword in line.lower() for keyword in ['position', 'code', 'description']):
+                formatted_lines.append(f"| {clean_line} |")
+                formatted_lines.append("|" + "-" * (len(clean_line) + 2) + "|")
+            else:
+                formatted_lines.append(f"| {clean_line} |")
+        
+        return '\n'.join(formatted_lines)
     
     def process_pptx(self, file_content: bytes, filename: str) -> Dict:
         """Extract text and images from PowerPoint presentation"""
@@ -275,54 +439,108 @@ class DocumentProcessor:
             return {"text": "", "images": [], "error": str(e)}
     
     def extract_error_codes_with_context(self, text: str) -> List[Dict]:
-        """Extract error codes with their descriptions and surrounding context"""
+        """Enhanced error code extraction with better pattern recognition for technical documents"""
         error_codes = []
         
-        # Multiple patterns to catch different formats
+        # Enhanced patterns for different error code formats
         patterns = [
-            r'([A-Fa-f0-9]{4})\s*[-:=]\s*(.{10,200})',  # Code: Description
-            r'Code\s+([A-Fa-f0-9]{4})\s*[-:]\s*(.{10,200})',  # Code XXXX: Description
-            r'Error\s+([A-Fa-f0-9]{4})\s*[-:]\s*(.{10,200})',  # Error XXXX: Description
-            r'([A-Fa-f0-9]{4})\s+(.{20,200})',  # Code followed by description
+            # Standard hex codes with descriptions
+            r'([A-Fa-f0-9]{4})\s*[-:=]\s*(.{10,300})',
+            # Codes in tables or structured format
+            r'Code\s+([A-Fa-f0-9]{4})\s*[-:]?\s*(.{10,300})',
+            r'Error\s+([A-Fa-f0-9]{4})\s*[-:]?\s*(.{10,300})',
+            # Technical codes (MSK, BLT, etc.) followed by descriptions
+            r'(MSK[0-9]|BLT|UVM)\s*[-:]?\s*(.{20,300})',
+            # Position-based codes (like in your table)
+            r'([0-9]+\.?)\s+([XxOo\s-]{8,})\s+(.{20,300})',
+            # French technical terms with codes
+            r'([A-Fa-f0-9]{4})\s+(.{20,300}?)(?:température|moteur|circuit|défaut)',
         ]
         
         lines = text.split('\n')
         for i, line in enumerate(lines):
             line = line.strip()
-            if not line:
+            if not line or len(line) < 10:
                 continue
-                
+            
             for pattern in patterns:
-                matches = re.findall(pattern, line, re.IGNORECASE)
+                matches = re.findall(pattern, line, re.IGNORECASE | re.MULTILINE)
                 for match in matches:
-                    code = match[0].upper()
-                    description = match[1].strip()
-                    
-                    # Clean up description
-                    description = re.sub(r'\s+', ' ', description)
-                    
-                    if len(description) > 10:  # Filter out short descriptions
-                        # Get surrounding context (previous and next lines)
+                    if len(match) >= 2:
+                        code = match[0].upper().strip()
+                        description = match[1].strip()
+                        
+                        # Clean up description
+                        description = re.sub(r'\s+', ' ', description)
+                        description = description[:300]  # Limit length
+                        
+                        # Skip if description is too short or just symbols
+                        if len(description) < 15 or re.match(r'^[XxOo\s-]+$', description):
+                            continue
+                        
+                        # Get extended context (surrounding lines)
                         context_lines = []
-                        for j in range(max(0, i-2), min(len(lines), i+3)):
-                            if lines[j].strip():
+                        for j in range(max(0, i-3), min(len(lines), i+4)):
+                            if lines[j].strip() and j != i:
                                 context_lines.append(lines[j].strip())
                         
-                        error_codes.append({
-                            "code": code,
-                            "description": description,
-                            "context": " ".join(context_lines),
-                            "line_number": i + 1
-                        })
+                        # Check for duplicate codes and merge if similar
+                        existing_code = next((ec for ec in error_codes if ec['code'] == code), None)
+                        if existing_code:
+                            # Merge descriptions if different
+                            if description not in existing_code['description']:
+                                existing_code['description'] += f" | {description}"
+                                existing_code['context'] += f" | {' '.join(context_lines)}"
+                        else:
+                            error_codes.append({
+                                "code": code,
+                                "description": description,
+                                "context": ' '.join(context_lines),
+                                "line_number": i + 1,
+                                "source_type": "technical_document"
+                            })
         
         return error_codes
+
+    def _get_enhanced_image_context(self, pdf_doc, page_num: int, page_text: str, page_tables: List) -> str:
+        """Get enhanced context for image including surrounding pages and table content"""
+        context_parts = []
+        
+        # Current page text
+        context_parts.append(page_text)
+        
+        # Previous page context
+        if page_num > 0:
+            try:
+                prev_page = pdf_doc.load_page(page_num - 1)
+                prev_text = prev_page.get_text()
+                context_parts.append(prev_text[-300:])  # Last 300 chars
+            except:
+                pass
+        
+        # Next page context
+        if page_num < len(pdf_doc) - 1:
+            try:
+                next_page = pdf_doc.load_page(page_num + 1)
+                next_text = next_page.get_text()
+                context_parts.append(next_text[:300])  # First 300 chars
+            except:
+                pass
+        
+        # Table context from current page
+        table_context = []
+        for table in page_tables:
+            table_context.append(table['formatted_text'])
+        context_parts.extend(table_context)
+        
+        return "\n\n".join(context_parts)
     
     def create_embeddings(self, texts: List[str]) -> np.ndarray:
         """Create vector embeddings for text chunks"""
         return self.model.encode(texts)
     
     def ingest_document(self, file_content: bytes, filename: str, file_type: str) -> bool:
-        """Process and store document with improved image-error code association"""
+        """Enhanced document ingestion with support for tables and structured content"""
         conn = None
         try:
             # Process document based on type
@@ -341,6 +559,8 @@ class DocumentProcessor:
             
             text_content = result["text"]
             images = result.get("images", [])
+            tables = result.get("tables", [])
+            structured_content = result.get("structured_content", [])
             
             # Store document
             conn = sqlite3.connect(self.db_manager.db_path, timeout=30.0)
@@ -348,8 +568,12 @@ class DocumentProcessor:
             
             conn.execute("BEGIN IMMEDIATE")
             
-            # Add metadata
-            metadata = {"image_count": len(images)}
+            # Enhanced metadata
+            metadata = {
+                "image_count": len(images),
+                "table_count": len(tables),
+                "structured_sections": len(structured_content)
+            }
             if file_type == "pptx":
                 slide_count = text_content.count("=== Slide")
                 metadata["slide_count"] = slide_count
@@ -361,103 +585,156 @@ class DocumentProcessor:
             
             doc_id = cursor.lastrowid
             
-            # Extract and store error codes
-            error_codes = self.extract_error_codes_with_context(text_content)
-            stored_error_codes = {}  # Track stored error codes for better image association
+            # Store tables separately for better search
+            for table in tables:
+                cursor.execute("""
+                    INSERT INTO tables (doc_id, table_id, page_number, raw_content, formatted_content, bbox)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    doc_id,
+                    table["id"],
+                    table["page"],
+                    table["raw_text"],
+                    table["formatted_text"],
+                    json.dumps(table["bbox"])
+                ))
             
+            # Enhanced error code extraction
+            error_codes = self.extract_error_codes_with_context(text_content)
+            
+            # Also extract from table content
+            for table in tables:
+                table_error_codes = self.extract_error_codes_with_context(table["raw_text"])
+                for code in table_error_codes:
+                    code["source_type"] = "table"
+                    code["table_id"] = table["id"]
+                error_codes.extend(table_error_codes)
+            
+            # Store error codes
+            # Store error codes (FIXED COLUMN LIST)
+            stored_error_codes = {}
             for error_code in error_codes:
                 cursor.execute("""
-                    INSERT OR REPLACE INTO error_codes (code, description, source_doc, procedure_steps, category) 
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO error_codes 
+                    (code, description, source_doc, procedure_steps, source_type, metadata) 
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """, (
                     error_code["code"], 
                     error_code["description"], 
                     filename,
                     error_code["context"],
-                    "extracted"
+                    error_code.get("source_type", "document"),
+                    json.dumps({
+                        "line_number": error_code.get("line_number"),
+                        "table_id": error_code.get("table_id")
+                    })
                 ))
                 stored_error_codes[error_code["code"]] = error_code
             
-            # Store images with improved error code association
+            # Store images with enhanced associations
             for i, img in enumerate(images):
                 if file_type == "pptx":
                     img_filename = f"{filename}_slide_{img['page']}_img_{i}"
                 else:
                     img_filename = f"{filename}_page_{img['page']}_img_{i}"
                 
-                # Determine the best error code association
+                # Enhanced error code association
                 best_associated_code = None
                 if img.get("associated_codes"):
-                    # Use the first associated code if it exists in our stored codes
                     for code in img["associated_codes"]:
                         if code in stored_error_codes:
                             best_associated_code = code
                             break
-                    
-                    # If no match in stored codes, use the first found code
-                    if not best_associated_code:
+                    if not best_associated_code and img["associated_codes"]:
                         best_associated_code = img["associated_codes"][0]
                 
-                # Enhanced description with context
+                # Enhanced description with table and context information
                 enhanced_description = f"Image from {filename} {'slide' if file_type == 'pptx' else 'page'} {img['page']}"
                 
-                # Add page text context to description for better search
-                if img.get('page_text'):
-                    page_text_clean = re.sub(r'\s+', ' ', img['page_text'][:200])  # Clean and truncate
-                    enhanced_description += f" - Context: {page_text_clean}"
+                # Add context from nearby tables
+                if img.get('associated_tables'):
+                    table_contexts = [t['formatted_text'][:100] for t in tables 
+                                    if t['id'] in img['associated_tables']]
+                    if table_contexts:
+                        enhanced_description += f" - Table context: {' | '.join(table_contexts)}"
                 
-                # Add error code context if available
-                if best_associated_code and best_associated_code in stored_error_codes:
-                    error_context = stored_error_codes[best_associated_code]['description'][:100]
-                    enhanced_description += f" - Related to: {error_context}"
+                # Add general context
+                if img.get('context'):
+                    context_clean = re.sub(r'\s+', ' ', img['context'][:200])
+                    enhanced_description += f" - Context: {context_clean}"
                 
-                # Store image in database
+                # Store image
                 cursor.execute("""
-                    INSERT INTO images (filename, image_data, description, step_number, associated_code) 
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO images 
+                    (filename, image_data, description, step_number, associated_code, metadata) 
+                    VALUES (?, ?, ?, ?, ?, ?)
                 """, (
                     img_filename, 
                     img["data"],
                     enhanced_description,
                     img['page'],
-                    best_associated_code
+                    best_associated_code,
+                    json.dumps({
+                        "associated_tables": img.get('associated_tables', []),
+                        "context_length": len(img.get('context', ''))
+                    })
                 ))
             
-            # Create embeddings for meaningful sentences only
+            # Create embeddings for meaningful content
+            all_content_for_embeddings = []
+            
+            # Regular sentences
             try:
                 sentences = sent_tokenize(text_content)
             except LookupError:
                 sentences = text_content.split('. ')
                 sentences = [s.strip() + '.' for s in sentences if s.strip()]
             
-            if sentences:
-                # Filter for meaningful sentences
-                meaningful_sentences = [
-                    s for s in sentences 
-                    if len(s.strip()) > 30 and  # Longer threshold
-                    not s.strip().startswith("=== Slide") and
-                    not s.strip().startswith("Page") and
-                    len(s.split()) > 5  # At least 5 words
-                ]
-                
-                if meaningful_sentences:
-                    # Create embeddings in batches for better performance
-                    batch_size = 50
-                    for i in range(0, len(meaningful_sentences), batch_size):
-                        batch = meaningful_sentences[i:i+batch_size]
-                        embeddings = self.create_embeddings(batch)
-                        
-                        for sentence, embedding in zip(batch, embeddings):
-                            cursor.execute("""
-                                INSERT INTO embeddings (content_id, content_type, embedding, text_content) 
-                                VALUES (?, ?, ?, ?)
-                            """, (str(doc_id), "document", pickle.dumps(embedding), sentence))
+            meaningful_sentences = [
+                s for s in sentences 
+                if len(s.strip()) > 30 and  
+                not s.strip().startswith("=== ") and
+                not s.strip().startswith("Page") and
+                len(s.split()) > 5
+            ]
+            all_content_for_embeddings.extend(meaningful_sentences)
+            
+            # Table content for embeddings
+            for table in tables:
+                table_lines = [line.strip() for line in table["formatted_text"].split('\n') 
+                            if line.strip() and not line.startswith('|---')]
+                all_content_for_embeddings.extend(table_lines)
+            
+            # Structured content for embeddings
+            for struct_item in structured_content:
+                if len(struct_item["text"]) > 20:
+                    all_content_for_embeddings.append(struct_item["text"])
+            
+            # Create embeddings in batches
+            if all_content_for_embeddings:
+                batch_size = 50
+                for i in range(0, len(all_content_for_embeddings), batch_size):
+                    batch = all_content_for_embeddings[i:i+batch_size]
+                    embeddings = self.create_embeddings(batch)
+                    
+                    for content, embedding in zip(batch, embeddings):
+                        cursor.execute("""
+                            INSERT INTO embeddings (content_id, content_type, embedding, text_content) 
+                            VALUES (?, ?, ?, ?)
+                        """, (str(doc_id), "document", pickle.dumps(embedding), content))
             
             conn.commit()
             
-            # Print summary of extracted images
+            # Print comprehensive summary
+            summary_parts = [f"Document processed: {filename}"]
             if images:
-                st.success(f"Extracted {len(images)} images from {filename}")
+                summary_parts.append(f"{len(images)} images")
+            if tables:
+                summary_parts.append(f"{len(tables)} tables")
+            if error_codes:
+                summary_parts.append(f"{len(error_codes)} error codes")
+            
+            st.success(" | ".join(summary_parts))
             
             return True
             

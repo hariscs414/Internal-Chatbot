@@ -31,7 +31,7 @@ class ChatbotEngine:
             api_key=api_key,
         )
     
-        def clear_user_context(self, username: str):
+    def clear_user_context(self, username: str):
         """Clear context memory for a specific user"""
         if username in self.context_memory:
             self.context_memory[username] = []
